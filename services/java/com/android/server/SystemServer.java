@@ -30,6 +30,8 @@ import android.content.Intent;
 import android.content.pm.IPackageManager;
 import android.content.pm.PackageManager;
 import android.content.res.Configuration;
+import android.database.ContentObserver;
+import android.database.Cursor;
 import android.media.AudioService;
 import android.media.tv.TvInputManager;
 import android.os.Build;
@@ -45,6 +47,7 @@ import android.os.StrictMode;
 import android.os.SystemClock;
 import android.os.SystemProperties;
 import android.os.UserHandle;
+import android.provider.Settings;
 import android.service.dreams.DreamService;
 import android.util.DisplayMetrics;
 import android.util.EventLog;
@@ -68,6 +71,7 @@ import com.android.server.display.DisplayManagerService;
 import com.android.server.dreams.DreamManagerService;
 import com.android.server.fingerprint.FingerprintService;
 import com.android.server.hdmi.HdmiControlService;
+import com.android.server.gesture.GestureService;
 import com.android.server.input.InputManagerService;
 import com.android.server.job.JobSchedulerService;
 import com.android.server.lights.LightsManager;
@@ -80,6 +84,7 @@ import com.android.server.net.NetworkStatsService;
 import com.android.server.notification.NotificationManagerService;
 import com.android.server.os.SchedulingPolicyService;
 import com.android.server.pm.BackgroundDexOptService;
+import com.android.server.gesture.EdgeGestureService;
 import com.android.server.pm.Installer;
 import com.android.server.pm.LauncherAppsService;
 import com.android.server.pm.PackageManagerService;
@@ -180,6 +185,19 @@ public final class SystemServer {
     public SystemServer() {
         // Check for factory test mode.
         mFactoryTestMode = FactoryTest.getMode();
+    }
+
+    private class AdbPortObserver extends ContentObserver {
+        public AdbPortObserver() {
+            super(null);
+        }
+        @Override
+        public void onChange(boolean selfChange) {
+            int adbPort = Settings.Secure.getInt(mContentResolver,
+                Settings.Secure.ADB_PORT, 0);
+            // setting this will control whether ADB runs on TCP/IP or USB
+            SystemProperties.set("service.adb.tcp.port", Integer.toString(adbPort));
+        }
     }
 
     private void run() {
@@ -526,6 +544,8 @@ public final class SystemServer {
         LockSettingsService lockSettings = null;
         AssetAtlasService atlas = null;
         MediaRouterService mediaRouter = null;
+        EdgeGestureService edgeGestureService = null;
+        GestureService gestureService = null;
 
         // Bring up services needed for UI.
         if (mFactoryTestMode != FactoryTest.FACTORY_TEST_LOW_LEVEL) {
@@ -931,6 +951,17 @@ public final class SystemServer {
                 }
             }
 
+            if (context.getResources().getBoolean(
+                    com.android.internal.R.bool.config_enableGestureService)) {
+                try {
+                    Slog.i(TAG, "Gesture Sensor Service");
+                    gestureService = new GestureService(context, inputManager);
+                    ServiceManager.addService("gesture", gestureService);
+                } catch (Throwable e) {
+                    Slog.e(TAG, "Failure starting Gesture Sensor Service", e);
+                }
+            }
+
             if (mPackageManager.hasSystemFeature(PackageManager.FEATURE_PRINTING)) {
                 mSystemServiceManager.startService(PRINT_MANAGER_SERVICE_CLASS);
             }
@@ -992,11 +1023,28 @@ public final class SystemServer {
             } else {
                 Slog.d(TAG, "Wipower not supported");
             }
+
+            try {
+                Slog.i(TAG, "EdgeGesture service");
+                edgeGestureService = new EdgeGestureService(context, inputManager);
+                ServiceManager.addService("edgegestureservice", edgeGestureService);
+            } catch (Throwable e) {
+                Slog.e(TAG, "Failure starting EdgeGesture service", e);
+            }
         }
 
         if (!disableNonCoreServices) {
             mSystemServiceManager.startService(MediaProjectionManagerService.class);
         }
+
+        // make sure the ADB_ENABLED setting value matches the secure property value
+        Settings.Secure.putInt(mContentResolver, Settings.Secure.ADB_PORT,
+                Integer.parseInt(SystemProperties.get("service.adb.tcp.port", "-1")));
+
+        // register observer to listen for settings changes
+        mContentResolver.registerContentObserver(
+            Settings.Secure.getUriFor(Settings.Secure.ADB_PORT),
+            false, new AdbPortObserver());
 
         // Before things start rolling, be sure we have decided whether
         // we are in safe mode.
@@ -1071,6 +1119,22 @@ public final class SystemServer {
             mDisplayManagerService.systemReady(safeMode, mOnlyCore);
         } catch (Throwable e) {
             reportWtf("making Display Manager Service ready", e);
+        }
+
+        if (edgeGestureService != null) {
+            try {
+                edgeGestureService.systemReady();
+            } catch (Throwable e) {
+                reportWtf("making EdgeGesture service ready", e);
+            }
+        }
+
+        if (gestureService != null) {
+            try {
+                gestureService.systemReady();
+            } catch (Throwable e) {
+                reportWtf("making Gesture Sensor Service ready", e);
+            }
         }
 
         // These are needed to propagate to the runnable below.
